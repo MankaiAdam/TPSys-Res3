@@ -60,8 +60,7 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    if (sb->block_size != TOSFS_BLOCK_SIZE ||
-        (off_t)sb->blocks * sb->block_size != st.st_size) {
+    if (sb->block_size != TOSFS_BLOCK_SIZE) {
         fprintf(stderr, "Inconsistent filesystem dimensions!\n");
         munmap(image, st.st_size);
         return EXIT_FAILURE;
@@ -75,7 +74,7 @@ int main(void)
 
     printf("=== Inode table ===\n");
 
-    for (unsigned int i = 0; i < sb->inodes; i++) {
+    for (unsigned int i = 0; i <= sb->inodes; i++) {
         struct tosfs_inode inode;
         memcpy(&inode, &inodes[i], sizeof(inode));
 

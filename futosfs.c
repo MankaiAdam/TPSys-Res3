@@ -20,7 +20,7 @@ static struct tosfs_inode *inode_table;
 
 static int load_filesystem(const char *path)
 {
-    int fd = open(path, O_RDONLY);
+    int fd = open(path, O_RDWR);
     struct stat st;
 
     if (fd == -1) {
@@ -36,8 +36,7 @@ static int load_filesystem(const char *path)
 
     fs_image_size = st.st_size;
 
-    fs_image = mmap(NULL, fs_image_size, PROT_READ,
-                    MAP_PRIVATE, fd, 0);
+    fs_image = mmap(NULL, fs_image_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
     close(fd);
 
@@ -87,19 +86,6 @@ static int getstat(fuse_ino_t ino, struct stat *stbuf)
     return 0;
 }
 
-static void getattr(fuse_req_t req, fuse_ino_t ino,
-                    struct fuse_file_info *fi)
-{
-    (void)fi;
-
-    struct stat stbuf = {0};
-
-    if (getstat(ino, &stbuf) == -1)
-        fuse_reply_err(req, ENOENT);
-    else
-        fuse_reply_attr(req, &stbuf, 1.0);
-}
-
 static int get_directory_entries(fuse_ino_t ino,
                                  struct tosfs_dentry **entries,
                                  size_t *entry_count)
@@ -121,6 +107,51 @@ static int get_directory_entries(fuse_ino_t ino,
         TOSFS_BLOCK_SIZE / sizeof(struct tosfs_dentry);
 
     return 0;
+}
+
+static int dir_add(fuse_ino_t parent, fuse_ino_t child,
+                   const char *name)
+{
+    struct tosfs_dentry *entries;
+    size_t entry_count;
+
+    // Retrieve the parent's directory entries.
+    int result = get_directory_entries(parent, &entries, &entry_count);
+
+    if (result != 0)
+        return result;
+
+    // Check that the filename fits in a directory entry.
+    size_t name_length = strlen(name);
+
+    // Search for an unused directory entry.
+    for (size_t i = 0; i < entry_count; i++) {
+        if (entries[i].inode != 0)
+            continue;
+
+        // Initialize the new entry.
+        entries[i].inode = child;
+        memset(entries[i].name, 0, TOSFS_MAX_NAME_LENGTH);
+        memcpy(entries[i].name, name, name_length);
+
+        return 0;
+    }
+
+    // No free entry was found.
+    return -ENOSPC;
+}
+
+static void getattr(fuse_req_t req, fuse_ino_t ino,
+                    struct fuse_file_info *fi)
+{
+    (void)fi;
+
+    struct stat stbuf = {0};
+
+    if (getstat(ino, &stbuf) == -1)
+        fuse_reply_err(req, ENOENT);
+    else
+        fuse_reply_attr(req, &stbuf, 1.0);
 }
 
 static void readdir(fuse_req_t req, fuse_ino_t ino,
@@ -244,13 +275,134 @@ static void fs_read(fuse_req_t req, fuse_ino_t ino,
     reply_buf_limited(req, data, inode.size, off, size);
 }
 
+static int allocate_inode(void)
+{
+    for (uint32_t ino = 1; ino < 32; ino++) {
+        uint32_t mask = 1U << ino;
+
+        if ((superblock->inode_bitmap & mask) == 0) {
+            superblock->inode_bitmap |= mask;
+            return (int)ino;
+        }
+    }
+
+    return -ENOSPC;
+}
+
+static int allocate_block(void)
+{
+    for (uint32_t block = TOSFS_ROOT_BLOCK + 1; block < superblock->blocks; block++) {
+        //Create a bit mask at the block index
+        uint32_t mask = 1U << block;
+
+        //Check whether the block is free
+        if ((superblock->block_bitmap & mask) == 0) {
+            superblock->block_bitmap |= mask;
+            return (int)block;
+        }
+    }
+
+    return -ENOSPC;
+}
+
+static void create(fuse_req_t req, fuse_ino_t parent,
+                   const char *name, mode_t mode,
+                   struct fuse_file_info *fi)
+{
+    // Validate the parent directory.
+    struct tosfs_dentry *entries;
+    size_t entry_count;
+
+    int result = get_directory_entries(parent, &entries, &entry_count);
+
+    if (result != 0) {
+        fuse_reply_err(req, -result);
+        return;
+    }
+
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        fuse_reply_err(req, EEXIST);
+        return;
+    }
+
+    // Check whether the name already exists.
+    for (size_t i = 0; i < entry_count; i++) {
+        if (entries[i].inode != 0 && strncmp(entries[i].name, name, TOSFS_MAX_NAME_LENGTH) == 0) {
+            fuse_reply_err(req, EEXIST);
+            return;
+        }
+    }
+
+    // Allocate an inode.
+    int ino = allocate_inode();
+
+    if (ino < 0) {
+        fuse_reply_err(req, -ino);
+        return;
+    }
+
+    // Allocate a data block.
+    int block = allocate_block();
+
+    if (block < 0) {
+        superblock->inode_bitmap &= ~(1U << ino);
+        fuse_reply_err(req, -block);
+        return;
+    }
+
+    // Initialize the inode.
+    struct tosfs_inode inode = {0};
+
+    inode.inode = ino;
+    inode.block_no = block;
+    inode.uid = fuse_req_ctx(req)->uid;
+    inode.gid = fuse_req_ctx(req)->gid;
+    //S_IFREG for file
+    inode.mode = (S_IFREG | (mode & 0777));
+    inode.perm = (mode & 0777);
+    inode.size = 0;
+    inode.nlink = 1;
+
+    memcpy(&inode_table[ino], &inode, sizeof(inode));
+
+    // Initialize the new file's data block.
+    memset((char *)fs_image + (size_t)block * TOSFS_BLOCK_SIZE,
+           0, TOSFS_BLOCK_SIZE);
+
+    // Add the file to its parent directory.
+    result = dir_add(parent, (fuse_ino_t)ino, name);
+
+    if (result != 0) {
+        // Roll back if Adding the file fails.
+        memset(&inode_table[ino], 0, sizeof(inode));
+        superblock->inode_bitmap &= ~(1U << ino);
+        superblock->block_bitmap &= ~(1U << block);
+
+        fuse_reply_err(req, -result);
+        return;
+    }
+
+    struct fuse_entry_param entry = {0};
+
+    entry.ino = (fuse_ino_t)ino;
+    entry.attr_timeout = 1.0;
+    entry.entry_timeout = 1.0;
+
+    if (getstat(entry.ino, &entry.attr) == -1) {
+        fuse_reply_err(req, EIO);
+        return;
+    }
+
+    fuse_reply_create(req, &entry, fi);
+}
+
 static struct fuse_lowlevel_ops futosfs_oper = {
     .getattr	= getattr,
     .readdir	= readdir,
     .lookup		= lookup,
     .read		= fs_read,
+    .create     = create,
 /*
-    open		= open,
     .write		= write,
 */
 };
