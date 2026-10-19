@@ -210,13 +210,47 @@ static void lookup(fuse_req_t req, fuse_ino_t parent,
     fuse_reply_err(req, ENOENT);
 }
 
+#define min(x, y) ((x) < (y) ? (x) : (y))
+
+static int reply_buf_limited(fuse_req_t req, const char *buf,
+                             size_t bufsize, off_t off, size_t maxsize)
+{
+    if (off >= 0 && (size_t)off < bufsize)
+        return fuse_reply_buf(req, buf + off,
+                              min(bufsize - (size_t)off, maxsize));
+
+    return fuse_reply_buf(req, NULL, 0);
+}
+
+static void fs_read(fuse_req_t req, fuse_ino_t ino,
+                       size_t size, off_t off,
+                       struct fuse_file_info *fi)
+{
+    (void)fi;
+
+    // Retrieve the inode.
+    struct tosfs_inode inode;
+    memcpy(&inode, &inode_table[ino], sizeof(inode));
+
+    // Calculate the file's starting position in the image.
+    size_t block_offset =
+        (size_t)inode.block_no * TOSFS_BLOCK_SIZE;
+
+    // Locate the requested bytes.
+    const char *data =
+        (const char *)fs_image + block_offset + (size_t)off;
+
+    // Return the requested data to FUSE.
+    reply_buf_limited(req, data, inode.size, off, size);
+}
+
 static struct fuse_lowlevel_ops futosfs_oper = {
     .getattr	= getattr,
     .readdir	= readdir,
     .lookup		= lookup,
+    .read		= fs_read,
 /*
     open		= open,
-    .read		= read,
     .write		= write,
 */
 };
