@@ -50,9 +50,7 @@ static int load_filesystem(const char *path)
     superblock = (struct tosfs_superblock *)fs_image;
 
     if (superblock->magic != TOSFS_MAGIC ||
-        superblock->block_size != TOSFS_BLOCK_SIZE ||
-        (size_t)superblock->blocks * superblock->block_size
-            != fs_image_size) {
+        superblock->block_size != TOSFS_BLOCK_SIZE) {
         fprintf(stderr, "Invalid filesystem image\n");
         munmap(fs_image, fs_image_size);
         fs_image = NULL;
@@ -81,6 +79,12 @@ static void getattr(fuse_req_t req, fuse_ino_t ino,
     struct tosfs_inode inode;
     memcpy(&inode, &inode_table[ino], sizeof(inode));
 
+    /*fprintf(stderr,
+        "getattr: requested ino=%lu, stored inode=%u, "
+        "mode=%06o, perm=%06o\n",
+        (unsigned long)ino, inode.inode,
+        inode.mode, inode.perm);
+*/
     if (inode.inode != ino) {
         fuse_reply_err(req, ENOENT);
         return;
@@ -90,7 +94,6 @@ static void getattr(fuse_req_t req, fuse_ino_t ino,
     stbuf.st_uid = inode.uid;
     stbuf.st_gid = inode.gid;
     stbuf.st_mode = inode.mode;
-    stbuf.st_mode |= inode.perm;
     stbuf.st_nlink = inode.nlink;
     stbuf.st_size = inode.size;
     stbuf.st_blksize = TOSFS_BLOCK_SIZE;
@@ -99,12 +102,76 @@ static void getattr(fuse_req_t req, fuse_ino_t ino,
     fuse_reply_attr(req, &stbuf, 1.0);
 }
 
-static struct fuse_lowlevel_ops futosfs_oper = {
+static void readdir(fuse_req_t req, fuse_ino_t ino,
+                    size_t size, off_t off,
+                    struct fuse_file_info *fi)
+{
+    (void)fi;
 
+    // Only handle valid inode numbers
+    if (ino == 0 ||
+        ino >= TOSFS_BLOCK_SIZE / sizeof(struct tosfs_inode)) {
+        fuse_reply_err(req, ENOENT);
+        return;
+        }
+
+    struct tosfs_inode inode;
+    memcpy(&inode, &inode_table[ino], sizeof(inode));
+
+    if (inode.inode != ino) {
+        fuse_reply_err(req, ENOENT);
+        return;
+    }
+
+    // The requested inode must be a directory.
+    if (!S_ISDIR(inode.mode)) {
+        fuse_reply_err(req, ENOTDIR);
+        return;
+    }
+
+    // Locate the directory's data block.
+    size_t block_offset = (size_t)inode.block_no * TOSFS_BLOCK_SIZE;
+
+
+    char *buffer = malloc(size);
+    if (buffer == NULL) {
+        fuse_reply_err(req, ENOMEM);
+        return;
+    }
+
+    size_t used = 0;
+    struct tosfs_dentry *entries =
+        (struct tosfs_dentry *)((char *)fs_image + block_offset);
+
+    size_t entry_count = TOSFS_BLOCK_SIZE / sizeof(struct tosfs_dentry);
+
+    for (size_t i = (size_t)off; i < entry_count; i++) {
+        if (entries[i].inode == 0)
+            continue;
+
+        struct stat st = {0};
+        st.st_ino = entries[i].inode;
+
+        size_t remaining = size - used;
+        size_t entry_size = fuse_add_direntry(
+            req, buffer + used, remaining,
+            entries[i].name, &st, (off_t)(i + 1));
+        if (entry_size > remaining)
+            break;
+
+        used += entry_size;
+    }
+
+    fuse_reply_buf(req, buffer, used);
+    free(buffer);
+}
+
+static struct fuse_lowlevel_ops futosfs_oper = {
     .getattr	= getattr,
- /*   .lookup		= lookup,getattr
     .readdir	= readdir,
-    .open		= open,
+/*
+    .lookup		= lookup,
+    open		= open,
     .read		= read,
     .write		= write,
 */
